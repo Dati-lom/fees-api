@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"encore.app/fees/money"
+	"encore.app/fees/store"
 	billworkflow "encore.app/fees/workflow"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
@@ -16,17 +17,24 @@ const (
 	temporalNamespace = client.DefaultNamespace
 )
 
+//encore:service
 type Service struct {
+	store    *store.Store
 	temporal client.Client
 	worker   worker.Worker
 }
 
 func initService() (*Service, error) {
 	ctx := context.Background()
+	st := store.New(db)
 
-	if err := loadCurrencies(ctx); err != nil {
+	// The currencies table is the source of truth; keep it in memory for
+	// validation (workflow code can't query the DB).
+	currencies, err := st.LoadCurrencies(ctx)
+	if err != nil {
 		return nil, err
 	}
+	money.SetSupportedCurrencies(currencies)
 
 	c, err := client.DialContext(ctx, client.Options{
 		HostPort:  temporalHostPort,
@@ -43,34 +51,11 @@ func initService() (*Service, error) {
 		return nil, fmt.Errorf("start temporal worker: %w", err)
 	}
 
-	return &Service{temporal: c, worker: w}, nil
+	return &Service{store: st, temporal: c, worker: w}, nil
 }
 
 // Shutdown is called by Encore on graceful shutdown.
 func (s *Service) Shutdown(force context.Context) {
 	s.worker.Stop()
 	s.temporal.Close()
-}
-
-// loadCurrencies moved currencies to DB so we just load in var for better usage
-func loadCurrencies(ctx context.Context) error {
-	rows, err := db.Query(ctx, `SELECT code, name, minor_units FROM currencies`)
-	if err != nil {
-		return fmt.Errorf("load currencies: %w", err)
-	}
-	defer rows.Close()
-
-	var currencies []money.Currency
-	for rows.Next() {
-		var c money.Currency
-		if err := rows.Scan(&c.Code, &c.Name, &c.MinorUnits); err != nil {
-			return fmt.Errorf("scan currency: %w", err)
-		}
-		currencies = append(currencies, c)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("load currencies: %w", err)
-	}
-	money.SetSupportedCurrencies(currencies)
-	return nil
 }
