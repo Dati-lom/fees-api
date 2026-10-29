@@ -211,12 +211,17 @@ func (w *billWorkflow) waitForPeriodEndOrClose(ctx workflow.Context) error {
 // close freezes the total, charges it and records the result. It reports
 // whether the bill ended CLOSED (true) or CHARGE_FAILED (false).
 func (w *billWorkflow) close(ctx workflow.Context) (bool, error) {
-	// Freeze first: from here on the validator rejects new items.
+	// Stop accepting items first: from here on the validator rejects them.
 	if err := w.bill.StartClosing(); err != nil {
 		return false, err
 	}
-	// Then wait for items accepted just before the freeze to be stored.
+	// Then wait for items accepted just before to be stored, or dropped if
+	// their insert failed, and only then compute the total, so it matches
+	// the items in the database.
 	if err := workflow.Await(ctx, func() bool { return w.inflight == 0 }); err != nil {
+		return false, err
+	}
+	if err := w.bill.FreezeTotal(); err != nil {
 		return false, err
 	}
 

@@ -159,16 +159,23 @@ func (b *Bill) TransitionTo(next Status) error {
 	return nil
 }
 
-// StartClosing stops accepting line items and freezes the total that will be
-// charged. A negative total means the account is owed a net credit.
-// Also used to retry from CHARGE_FAILED; items can't change after OPEN, so
-// the recomputed total is the same.
+// StartClosing stops accepting line items. Also used to retry from
+// CHARGE_FAILED. Call FreezeTotal once the items accepted before this point
+// have settled.
 func (b *Bill) StartClosing() error {
+	return b.TransitionTo(StatusClosing)
+}
+
+// FreezeTotal fixes the total that will be charged. A negative total means
+// the account is owed a net credit. On a retry from CHARGE_FAILED items
+// can't have changed, so the recomputed total is the same.
+func (b *Bill) FreezeTotal() error {
+	if b.Status != StatusClosing {
+		return fmt.Errorf("%w: can only freeze the total while %s, bill is %s",
+			ErrInvalidTransition, StatusClosing, b.Status)
+	}
 	total, err := b.ComputeTotal()
 	if err != nil {
-		return err
-	}
-	if err := b.TransitionTo(StatusClosing); err != nil {
 		return err
 	}
 	b.Total = &total
