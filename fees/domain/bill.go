@@ -30,6 +30,9 @@ var (
 	ErrInvalidTransition = errors.New("invalid status transition")
 	ErrInvalidAmount     = errors.New("line item amount must be non-zero")
 	ErrInvalidPeriod     = errors.New("period end must be after period start")
+	// ErrNegativeTotal means a refund is larger than what the bill currently
+	// charges. Bills never go negative, so there is never a credit to track.
+	ErrNegativeTotal = errors.New("refund exceeds the bill's current total")
 	// ErrIdempotencyKeyReused means a request reused an idempotency key with
 	// a different body. Returning the original result would hide the
 	// caller's bug, so it is rejected instead.
@@ -64,7 +67,7 @@ type LineItem struct {
 	ID          uuid.UUID
 	BillID      uuid.UUID
 	Description string
-	// Amount is positive for a fee and negative for a refund/credit.
+	// Amount is positive for a fee and negative for a refund.
 	Amount money.Money
 	// IdempotencyKey is supplied by the caller so retried requests don't double-charge.
 	IdempotencyKey string
@@ -126,6 +129,19 @@ func (b *Bill) ValidateLineItem(item LineItem) error {
 	if item.Amount.IsZero() {
 		return ErrInvalidAmount
 	}
+	if !item.Amount.IsPositive() {
+		total, err := b.ComputeTotal()
+		if err != nil {
+			return err
+		}
+		after, err := total.Add(item.Amount)
+		if err != nil {
+			return err
+		}
+		if after.Amount < 0 {
+			return fmt.Errorf("%w: total is %s, refund is %s", ErrNegativeTotal, total, item.Amount)
+		}
+	}
 	return nil
 }
 
@@ -166,8 +182,8 @@ func (b *Bill) StartClosing() error {
 	return b.TransitionTo(StatusClosing)
 }
 
-// FreezeTotal fixes the total that will be charged. A negative total means
-// the account is owed a net credit. On a retry from CHARGE_FAILED items
+// FreezeTotal fixes the total that will be charged. It is never negative,
+// because ValidateLineItem rejects refunds larger than the total. On a retry from CHARGE_FAILED items
 // can't have changed, so the recomputed total is the same.
 func (b *Bill) FreezeTotal() error {
 	if b.Status != StatusClosing {

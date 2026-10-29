@@ -39,6 +39,7 @@ const (
 	ErrTypeInvalidAmount    = "InvalidAmount"
 	ErrTypeInvalidBill      = "InvalidBill"
 	ErrTypeKeyReused        = "IdempotencyKeyReused"
+	ErrTypeNegativeTotal    = "NegativeTotal"
 )
 
 // WorkflowID returns the workflow ID for a bill. Using the bill ID makes
@@ -236,8 +237,7 @@ func (w *billWorkflow) close(ctx workflow.Context) (bool, error) {
 	}
 	w.frozen = true
 
-	// Nothing to charge when refunds cancel out or exceed fees; the bill
-	// closes with its (zero or negative) total recorded as a credit.
+	// Nothing to charge when refunds cancel out the fees.
 	if total.IsPositive() {
 		if err := w.charge(ctx, total); err != nil {
 			if err := w.bill.MarkChargeFailed(); err != nil {
@@ -346,6 +346,8 @@ func rejection(err error) error {
 		errType = ErrTypeInvalidAmount
 	case errors.Is(err, domain.ErrIdempotencyKeyReused):
 		errType = ErrTypeKeyReused
+	case errors.Is(err, domain.ErrNegativeTotal):
+		errType = ErrTypeNegativeTotal
 	default:
 		return err
 	}

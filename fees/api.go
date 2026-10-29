@@ -80,7 +80,8 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 
 // AddLineItem adds a fee (positive amount) or refund (negative) to an open
 // bill. It returns only once the item is stored, and fails with 409 if the
-// bill is no longer open. Retrying with the same Idempotency-Key and body
+// bill is no longer open. A refund larger than the bill's current total fails
+// with 400, so a bill never ends with a credit. Retrying with the same Idempotency-Key and body
 // returns the original item; reusing the key with a different body fails
 // with 400.
 //
@@ -281,6 +282,8 @@ func toAPIError(err error) error {
 			billworkflow.ErrTypeInvalidBill,
 			billworkflow.ErrTypeKeyReused:
 			return errs.B().Code(errs.InvalidArgument).Msg(appErr.Message()).Err()
+		case billworkflow.ErrTypeNegativeTotal:
+			return errs.B().Code(errs.FailedPrecondition).Msg(appErr.Message()).Err()
 		case billworkflow.ErrTypeNotFound:
 			return errs.B().Code(errs.NotFound).Msg("bill not found").Err()
 		}

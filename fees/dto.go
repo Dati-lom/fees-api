@@ -58,7 +58,8 @@ type AddLineItemRequest struct {
 	// IdempotencyKey lets clients safely retry: the same key is never added twice.
 	IdempotencyKey string `header:"Idempotency-Key"`
 	Description    string `json:"description"`
-	// Amount is in minor units; negative for a refund. Currency must match the bill.
+	// Amount is in minor units; negative for a refund, which can't exceed the
+	// bill's current total. Currency must match the bill.
 	Amount money.Money `json:"amount"`
 }
 

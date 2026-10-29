@@ -34,6 +34,7 @@ CREATE TABLE bills (
     -- Mirrors the domain state machine so bad writes fail at the DB too.
     CHECK ((status = 'OPEN') = (total_amount IS NULL)),
     CHECK ((status = 'CLOSED') = (closed_at IS NOT NULL)),
+    CHECK (total_amount >= 0),
 
     -- Target for line_items' composite foreign key below.
     UNIQUE (id, currency)
