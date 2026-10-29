@@ -19,4 +19,8 @@ var secrets struct {
 	// has no auth, and Encore reads an unset secret as "" when running
 	// locally (in the cloud a missing secret stops the service).
 	TemporalAPIKey string
+
+	// ServiceToken is the bearer token callers of the API must send (see
+	// AuthHandler). Locally it is set in .secrets.local.cue.
+	ServiceToken string
 }

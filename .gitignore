@@ -7,3 +7,5 @@ encore.gen.cue
 /encore.gen
 fees/workflow/bill_workflow_test.go
 fees/domain/bill_test.go
+# Local secret values
+.secrets.local.cue

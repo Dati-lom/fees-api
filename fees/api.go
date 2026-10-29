@@ -33,7 +33,7 @@ var billIDNamespace = uuid.Must(uuid.FromString("6f2a4c1e-8d3b-4f5a-9c7e-2b1d0e3
 // Idempotency-Key and body returns the existing bill; reusing the key with a
 // different body fails with 400.
 //
-//encore:api public method=POST path=/bills
+//encore:api auth method=POST path=/bills
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*BillResponse, error) {
 	id := uuid.NewV5(billIDNamespace, req.AccountID+"/"+req.IdempotencyKey)
 	params := req.toParams(id, time.Now().UTC())
@@ -85,7 +85,7 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 // returns the original item; reusing the key with a different body fails
 // with 400.
 //
-//encore:api public method=POST path=/bills/:id/line-items
+//encore:api auth method=POST path=/bills/:id/line-items
 func (s *Service) AddLineItem(ctx context.Context, id uuid.UUID, req *AddLineItemRequest) (*LineItemResponse, error) {
 	itemID, err := uuid.NewV4()
 	if err != nil {
@@ -127,7 +127,7 @@ func (s *Service) AddLineItem(ctx context.Context, id uuid.UUID, req *AddLineIte
 // Closing an already closing or closed bill returns it unchanged, so retries
 // are safe.
 //
-//encore:api public method=POST path=/bills/:id/close
+//encore:api auth method=POST path=/bills/:id/close
 func (s *Service) CloseBill(ctx context.Context, id uuid.UUID) (*BillResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, workflowCallTimeout)
 	defer cancel()
@@ -157,7 +157,7 @@ func (s *Service) CloseBill(ctx context.Context, id uuid.UUID) (*BillResponse, e
 
 // RetryCharge retries closing a bill whose charge failed.
 //
-//encore:api public method=POST path=/bills/:id/retry-charge
+//encore:api auth method=POST path=/bills/:id/retry-charge
 func (s *Service) RetryCharge(ctx context.Context, id uuid.UUID) (*BillResponse, error) {
 	bill, err := s.GetBill(ctx, id)
 	if err != nil {
@@ -178,7 +178,7 @@ func (s *Service) RetryCharge(ctx context.Context, id uuid.UUID) (*BillResponse,
 
 // GetBill returns a bill with its line items and, once closing, its total.
 //
-//encore:api public method=GET path=/bills/:id
+//encore:api auth method=GET path=/bills/:id
 func (s *Service) GetBill(ctx context.Context, id uuid.UUID) (*BillResponse, error) {
 	bill, err := s.getBill(ctx, id)
 	if err != nil {
@@ -216,7 +216,7 @@ func (s *Service) getBill(ctx context.Context, id uuid.UUID) (domain.Bill, error
 // ListBills lists bills, newest period first, optionally filtered by account
 // and status.
 //
-//encore:api public method=GET path=/bills
+//encore:api auth method=GET path=/bills
 func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBillsResponse, error) {
 	bills, err := s.store.ListBills(ctx, store.ListBillsFilter{
 		AccountID: req.AccountID,
@@ -235,7 +235,7 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 
 // ListCurrencies lists the currencies bills can be opened in.
 //
-//encore:api public method=GET path=/currencies
+//encore:api auth method=GET path=/currencies
 func (s *Service) ListCurrencies(ctx context.Context) (*ListCurrenciesResponse, error) {
 	currencies, err := s.store.ListCurrencies(ctx)
 	if err != nil {
