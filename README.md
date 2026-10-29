@@ -252,3 +252,21 @@ whole activity with backoff.
 it, a close committed between the two queries could return a total that doesn't match the
 items listed. A read-only snapshot can't cause write skew, so `SERIALIZABLE` isn't needed
 there; it would only add aborts.
+
+
+### A note on the design: line items outside the workflow
+
+Another approach would be to keep the workflow for the bill's lifecycle only (the
+period-end timer, the close and the charge) and write line items straight to Postgres
+instead of through the workflow. That approach would be cleaner: it gives one source of
+truth for items, and no per-bill throughput limit or growing workflow history. The
+database already makes it safe. Inserting an item checks that the bill is `OPEN` in a
+`SERIALIZABLE` transaction, which takes care of the anomalies (write skew, phantom reads)
+that could otherwise let an item land on a bill that is already closing.
+
+I kept items in the workflow because the task describes the bill as accruing fees
+progressively through a workflow started at the beginning of the period. Routing items
+through it also gives one place that decides what's on the bill, and callers get an
+immediate accept or reject through Temporal Updates. At fee-bill volumes the cost is
+small. If an account generated thousands of fees per period, I'd move items to the
+database and leave the workflow with the timer, the close and the charge.

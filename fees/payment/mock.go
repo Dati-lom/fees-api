@@ -57,3 +57,10 @@ func (m *MockCharger) Charge(ctx context.Context, req ChargeRequest) (ChargeResu
 	m.charges[req.IdempotencyKey] = res
 	return res, nil
 }
+
+// Charges returns how many distinct charges were made, for tests.
+func (m *MockCharger) Charges() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.charges)
+}
