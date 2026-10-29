@@ -30,7 +30,8 @@ const workflowCallTimeout = 10 * time.Second
 var billIDNamespace = uuid.Must(uuid.FromString("6f2a4c1e-8d3b-4f5a-9c7e-2b1d0e3f4a5b"))
 
 // CreateBill opens a new bill and starts its workflow. Retrying with the same
-// Idempotency-Key returns the existing bill.
+// Idempotency-Key and body returns the existing bill; reusing the key with a
+// different body fails with 400.
 //
 //encore:api public method=POST path=/bills
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*BillResponse, error) {
@@ -54,12 +55,23 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 		// A bill's workflow ID is never reused, even after it completes,
 		// so a late retry can't reopen a closed bill.
 		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		// Without this, starting a workflow that is still running silently
+		// returns the existing run, and we'd answer a retry with a bill built
+		// from the retry's body instead of the bill that actually exists.
+		WorkflowExecutionErrorWhenAlreadyStarted: true,
 	}, billworkflow.BillWorkflow, params)
 
 	var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
 	switch {
 	case errors.As(err, &alreadyStarted):
-		return s.GetBill(ctx, id)
+		existing, err := s.getBill(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if !params.Matches(existing) {
+			return nil, toAPIError(domain.ErrIdempotencyKeyReused)
+		}
+		return newBillResponse(existing), nil
 	case err != nil:
 		return nil, errs.WrapCode(err, errs.Unavailable, "could not start bill workflow")
 	}
@@ -68,7 +80,9 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 
 // AddLineItem adds a fee (positive amount) or refund (negative) to an open
 // bill. It returns only once the item is stored, and fails with 409 if the
-// bill is no longer open.
+// bill is no longer open. Retrying with the same Idempotency-Key and body
+// returns the original item; reusing the key with a different body fails
+// with 400.
 //
 //encore:api public method=POST path=/bills/:id/line-items
 func (s *Service) AddLineItem(ctx context.Context, id uuid.UUID, req *AddLineItemRequest) (*LineItemResponse, error) {
@@ -80,13 +94,14 @@ func (s *Service) AddLineItem(ctx context.Context, id uuid.UUID, req *AddLineIte
 	ctx, cancel := context.WithTimeout(ctx, workflowCallTimeout)
 	defer cancel()
 
+	in := req.toInput(itemID)
 	handle, err := s.temporal.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
 		WorkflowID: billworkflow.WorkflowID(id),
 		// Temporal deduplicates updates by ID, so a retried request is
 		// applied once.
 		UpdateID:     req.IdempotencyKey,
 		UpdateName:   billworkflow.UpdateAddLineItem,
-		Args:         []any{req.toInput(itemID)},
+		Args:         []any{in},
 		WaitForStage: client.WorkflowUpdateStageCompleted,
 	})
 	if err != nil {
@@ -95,6 +110,12 @@ func (s *Service) AddLineItem(ctx context.Context, id uuid.UUID, req *AddLineIte
 	var item domain.LineItem
 	if err := handle.Get(ctx, &item); err != nil {
 		return nil, s.workflowCallError(ctx, id, err)
+	}
+	// For a repeated UpdateID Temporal returns the first update's result
+	// without running the workflow's validator, so a reused key is caught
+	// here rather than there.
+	if !in.Matches(item) {
+		return nil, toAPIError(domain.ErrIdempotencyKeyReused)
 	}
 	return newLineItemResponse(item), nil
 }
@@ -158,12 +179,21 @@ func (s *Service) RetryCharge(ctx context.Context, id uuid.UUID) (*BillResponse,
 //
 //encore:api public method=GET path=/bills/:id
 func (s *Service) GetBill(ctx context.Context, id uuid.UUID) (*BillResponse, error) {
+	bill, err := s.getBill(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return newBillResponse(bill), nil
+}
+
+// getBill reads a bill from the database, falling back to its workflow.
+func (s *Service) getBill(ctx context.Context, id uuid.UUID) (domain.Bill, error) {
 	bill, err := s.store.GetBill(ctx, id)
 	if err == nil {
-		return newBillResponse(bill), nil
+		return bill, nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
-		return nil, toAPIError(err)
+		return domain.Bill{}, toAPIError(err)
 	}
 
 	// Right after CreateBill the workflow may not have stored the bill yet;
@@ -172,14 +202,14 @@ func (s *Service) GetBill(ctx context.Context, id uuid.UUID) (*BillResponse, err
 	if err != nil {
 		var notFound *serviceerror.NotFound
 		if errors.As(err, &notFound) {
-			return nil, errs.B().Code(errs.NotFound).Msg("bill not found").Err()
+			return domain.Bill{}, errs.B().Code(errs.NotFound).Msg("bill not found").Err()
 		}
-		return nil, errs.WrapCode(err, errs.Unavailable, "query bill workflow")
+		return domain.Bill{}, errs.WrapCode(err, errs.Unavailable, "query bill workflow")
 	}
 	if err := res.Get(&bill); err != nil {
-		return nil, errs.WrapCode(err, errs.Internal, "decode bill")
+		return domain.Bill{}, errs.WrapCode(err, errs.Internal, "decode bill")
 	}
-	return newBillResponse(bill), nil
+	return bill, nil
 }
 
 // ListBills lists bills, newest period first, optionally filtered by account
@@ -248,7 +278,8 @@ func toAPIError(err error) error {
 			return errs.B().Code(errs.Aborted).Msg("bill is not open").Err()
 		case billworkflow.ErrTypeCurrencyMismatch,
 			billworkflow.ErrTypeInvalidAmount,
-			billworkflow.ErrTypeInvalidBill:
+			billworkflow.ErrTypeInvalidBill,
+			billworkflow.ErrTypeKeyReused:
 			return errs.B().Code(errs.InvalidArgument).Msg(appErr.Message()).Err()
 		case billworkflow.ErrTypeNotFound:
 			return errs.B().Code(errs.NotFound).Msg("bill not found").Err()
@@ -259,7 +290,10 @@ func toAPIError(err error) error {
 	case errors.Is(err, domain.ErrInvalidPeriod),
 		errors.Is(err, domain.ErrInvalidAmount),
 		errors.Is(err, money.ErrUnsupportedCurrency),
-		errors.Is(err, money.ErrCurrencyMismatch):
+		errors.Is(err, money.ErrCurrencyMismatch),
+		// 422 would fit better, but errs has no such code; 400 is also
+		// what Stripe returns for this.
+		errors.Is(err, domain.ErrIdempotencyKeyReused):
 		return errs.B().Code(errs.InvalidArgument).Msg(err.Error()).Err()
 	case errors.Is(err, domain.ErrBillNotOpen), errors.Is(err, store.ErrBillNotOpen):
 		return errs.B().Code(errs.Aborted).Msg("bill is not open").Err()

@@ -47,8 +47,8 @@ func (r *CreateBillRequest) toParams(id uuid.UUID, now time.Time) domain.NewBill
 		ID:          id,
 		AccountID:   strings.TrimSpace(r.AccountID),
 		Currency:    r.Currency,
-		PeriodStart: r.PeriodStart,
-		PeriodEnd:   r.PeriodEnd,
+		PeriodStart: dbTime(r.PeriodStart),
+		PeriodEnd:   dbTime(r.PeriodEnd),
 		Now:         now,
 	}
 }
@@ -133,16 +133,21 @@ func newBillResponse(b domain.Bill) *BillResponse {
 	for _, li := range b.LineItems {
 		items = append(items, *newLineItemResponse(li))
 	}
+	var closedAt *time.Time
+	if b.ClosedAt != nil {
+		t := dbTime(*b.ClosedAt)
+		closedAt = &t
+	}
 	return &BillResponse{
 		ID:          b.ID,
 		AccountID:   b.AccountID,
 		Currency:    b.Currency,
 		Status:      b.Status,
-		PeriodStart: b.PeriodStart,
-		PeriodEnd:   b.PeriodEnd,
+		PeriodStart: dbTime(b.PeriodStart),
+		PeriodEnd:   dbTime(b.PeriodEnd),
 		Total:       b.Total,
-		CreatedAt:   b.CreatedAt,
-		ClosedAt:    b.ClosedAt,
+		CreatedAt:   dbTime(b.CreatedAt),
+		ClosedAt:    closedAt,
 		LineItems:   items,
 	}
 }
@@ -152,7 +157,7 @@ func newLineItemResponse(li domain.LineItem) *LineItemResponse {
 		ID:          li.ID,
 		Description: li.Description,
 		Amount:      li.Amount,
-		CreatedAt:   li.CreatedAt,
+		CreatedAt:   dbTime(li.CreatedAt),
 	}
 }
 
@@ -166,4 +171,12 @@ type CurrencyResponse struct {
 	// MinorUnits is the number of decimal places amounts are expressed in:
 	// 2 means an amount of 1250 is 12.50.
 	MinorUnits int `json:"minor_units"`
+}
+
+// dbTime normalises t to what Postgres stores (UTC, microsecond precision),
+// so a bill read back from the database compares equal to the request that
+// created it, and responses look the same whether they were built from the
+// database or from the workflow.
+func dbTime(t time.Time) time.Time {
+	return t.UTC().Truncate(time.Microsecond)
 }

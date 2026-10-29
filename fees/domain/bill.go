@@ -30,6 +30,10 @@ var (
 	ErrInvalidTransition = errors.New("invalid status transition")
 	ErrInvalidAmount     = errors.New("line item amount must be non-zero")
 	ErrInvalidPeriod     = errors.New("period end must be after period start")
+	// ErrIdempotencyKeyReused means a request reused an idempotency key with
+	// a different body. Returning the original result would hide the
+	// caller's bug, so it is rejected instead.
+	ErrIdempotencyKeyReused = errors.New("idempotency key was already used with a different request")
 )
 
 func (s Status) CanTransitionTo(next Status) bool {
@@ -99,6 +103,16 @@ func NewBill(p NewBillParams) (Bill, error) {
 		CreatedAt:   p.Now,
 		LineItems:   []LineItem{},
 	}, nil
+}
+
+// Matches reports whether b is the bill p describes, i.e. whether p is a
+// genuine retry of the request that created b. ID and Now are ignored: the ID
+// is derived from the idempotency key and Now differs on every retry.
+func (p NewBillParams) Matches(b Bill) bool {
+	return p.AccountID == b.AccountID &&
+		p.Currency == b.Currency &&
+		p.PeriodStart.Equal(b.PeriodStart) &&
+		p.PeriodEnd.Equal(b.PeriodEnd)
 }
 
 // ValidateLineItem checks that item can be added to b.

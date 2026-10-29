@@ -38,6 +38,7 @@ const (
 	ErrTypeCurrencyMismatch = "CurrencyMismatch"
 	ErrTypeInvalidAmount    = "InvalidAmount"
 	ErrTypeInvalidBill      = "InvalidBill"
+	ErrTypeKeyReused        = "IdempotencyKeyReused"
 )
 
 // WorkflowID returns the workflow ID for a bill. Using the bill ID makes
@@ -53,6 +54,13 @@ type AddLineItemInput struct {
 	Description    string
 	Amount         money.Money
 	IdempotencyKey string
+}
+
+// Matches reports whether item is what in describes, i.e. whether in is a
+// genuine retry of the request that added item. ID is ignored: the API
+// generates a new one on every attempt.
+func (in AddLineItemInput) Matches(item domain.LineItem) bool {
+	return in.Description == item.Description && in.Amount == item.Amount
 }
 
 // acts is only used to name activity methods for ExecuteActivity.
@@ -145,8 +153,13 @@ func (w *billWorkflow) requestClose(ctx workflow.Context) (domain.Bill, error) {
 // not written to workflow history, so invalid requests cost nothing.
 // It must not change state.
 func (w *billWorkflow) validateLineItem(ctx workflow.Context, in AddLineItemInput) error {
-	if _, ok := w.findItem(in.IdempotencyKey); ok {
-		return nil // retry of an item already accepted: always succeeds
+	if existing, ok := w.findItem(in.IdempotencyKey); ok {
+		// A retry of an item already accepted succeeds, even once the bill
+		// is closed, but only if it is the same request.
+		if !in.Matches(existing) {
+			return rejection(domain.ErrIdempotencyKeyReused)
+		}
+		return nil
 	}
 	return rejection(w.bill.ValidateLineItem(w.newLineItem(ctx, in)))
 }
@@ -154,6 +167,9 @@ func (w *billWorkflow) validateLineItem(ctx workflow.Context, in AddLineItemInpu
 // addLineItem adds the item to the bill and stores it, replying only once
 // the item is in the database.
 func (w *billWorkflow) addLineItem(ctx workflow.Context, in AddLineItemInput) (domain.LineItem, error) {
+	// The validator has already rejected a reused key with a different
+	// request, and nothing can change in between: validator and handler run
+	// in the same workflow task.
 	if existing, ok := w.findItem(in.IdempotencyKey); ok {
 		return existing, nil
 	}
@@ -323,6 +339,8 @@ func rejection(err error) error {
 		errType = ErrTypeCurrencyMismatch
 	case errors.Is(err, domain.ErrInvalidAmount):
 		errType = ErrTypeInvalidAmount
+	case errors.Is(err, domain.ErrIdempotencyKeyReused):
+		errType = ErrTypeKeyReused
 	default:
 		return err
 	}
