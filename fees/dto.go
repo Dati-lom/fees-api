@@ -16,10 +16,10 @@ import (
 
 // CreateBillRequest is the body of POST /bills.
 type CreateBillRequest struct {
-	AccountID   string         `json:"account_id"`
-	Currency    money.Currency `json:"currency"`
-	PeriodStart time.Time      `json:"period_start"`
-	PeriodEnd   time.Time      `json:"period_end"`
+	AccountID   string             `json:"account_id"`
+	Currency    money.CurrencyCode `json:"currency"`
+	PeriodStart time.Time          `json:"period_start"`
+	PeriodEnd   time.Time          `json:"period_end"`
 }
 
 // Validate is called by Encore before the handler runs.
@@ -80,7 +80,7 @@ func (r *AddLineItemRequest) toLineItem(id, billID uuid.UUID, now time.Time) dom
 type BillResponse struct {
 	ID          uuid.UUID          `json:"id"`
 	AccountID   string             `json:"account_id"`
-	Currency    money.Currency     `json:"currency"`
+	Currency    money.CurrencyCode `json:"currency"`
 	Status      domain.Status      `json:"status"`
 	PeriodStart time.Time          `json:"period_start"`
 	PeriodEnd   time.Time          `json:"period_end"`

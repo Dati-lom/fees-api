@@ -46,7 +46,7 @@ func (s Status) IsTerminal() bool { return s == StatusClosed }
 type Bill struct {
 	ID          uuid.UUID
 	AccountID   string
-	Currency    money.Currency
+	Currency    money.CurrencyCode
 	Status      Status
 	PeriodStart time.Time
 	PeriodEnd   time.Time
@@ -73,7 +73,7 @@ type LineItem struct {
 type NewBillParams struct {
 	ID          uuid.UUID
 	AccountID   string
-	Currency    money.Currency
+	Currency    money.CurrencyCode
 	PeriodStart time.Time
 	PeriodEnd   time.Time
 	Now         time.Time
