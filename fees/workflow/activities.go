@@ -105,10 +105,10 @@ type ChargeBillInput struct {
 	BillID    uuid.UUID
 	AccountID string
 	Amount    money.Money
-	// Attempt counts closing attempts (1 for the first, 2 after a retry from
-	// CHARGE_FAILED, ...). It is part of the idempotency key so a retried
-	// close is a new charge, while Temporal's retries of one attempt are not.
-	Attempt int
+	// IdempotencyKey is chosen by the workflow (see chargeIdempotencyKey) and
+	// passed to the provider unchanged, so every retry of the same charge,
+	// by Temporal or after CHARGE_FAILED, is deduplicated by the provider.
+	IdempotencyKey string
 }
 
 type ChargeBillResult struct {
@@ -127,7 +127,7 @@ func (a *Activities) ChargeBill(ctx context.Context, in ChargeBillInput) (Charge
 		BillID:         in.BillID,
 		AccountID:      in.AccountID,
 		Amount:         in.Amount,
-		IdempotencyKey: fmt.Sprintf("%s-%d", in.BillID, in.Attempt),
+		IdempotencyKey: in.IdempotencyKey,
 	})
 	if errors.Is(err, payment.ErrDeclined) {
 		return ChargeBillResult{}, temporal.NewNonRetryableApplicationError(err.Error(), ErrTypeChargeDeclined, err)

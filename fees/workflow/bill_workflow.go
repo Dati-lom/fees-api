@@ -8,6 +8,7 @@ package workflow
 
 import (
 	"errors"
+	"fmt"
 
 	"encore.app/fees/domain"
 	"encore.app/fees/money"
@@ -23,8 +24,9 @@ const TaskQueue = "fees"
 const (
 	// UpdateAddLineItem adds a line item and returns it, or rejects it.
 	UpdateAddLineItem = "addLineItem"
-	// SignalClose closes the bill before its period ends.
-	SignalClose = "close"
+	// UpdateClose closes the bill before its period ends and returns it once
+	// its total is frozen. Charging continues in the background.
+	UpdateClose = "close"
 	// SignalRetryCharge retries closing a bill that is CHARGE_FAILED.
 	SignalRetryCharge = "retryCharge"
 	// QueryGetBill returns the workflow's current view of the bill.
@@ -62,8 +64,15 @@ type billWorkflow struct {
 	persisted bool
 	// inflight counts accepted line items whose DB insert hasn't finished.
 	// Closing waits for it to reach zero so the DB sum matches the total.
-	inflight      int
-	chargeAttempt int
+	inflight int
+	// closeRequested is set by UpdateClose; the main loop acts on it.
+	closeRequested bool
+	// frozen is set once the CLOSING status and total are stored, i.e. the
+	// amount to charge is fixed for good.
+	frozen bool
+	// declinedCharges counts charges the provider declined; it selects the
+	// idempotency key of the next charge (see chargeIdempotencyKey).
+	declinedCharges int
 }
 
 // BillWorkflow runs for the whole life of one bill:
@@ -86,7 +95,9 @@ func BillWorkflow(ctx workflow.Context, params domain.NewBillParams) error {
 	}
 	w.persisted = true
 
-	w.waitForPeriodEndOrClose(ctx)
+	if err := w.waitForPeriodEndOrClose(ctx); err != nil {
+		return err
+	}
 
 	for {
 		closed, err := w.close(ctx)
@@ -111,8 +122,23 @@ func (w *billWorkflow) registerHandlers(ctx workflow.Context) error {
 	if err != nil {
 		return err
 	}
-	return workflow.SetUpdateHandlerWithOptions(ctx, UpdateAddLineItem, w.addLineItem,
+	err = workflow.SetUpdateHandlerWithOptions(ctx, UpdateAddLineItem, w.addLineItem,
 		workflow.UpdateHandlerOptions{Validator: w.validateLineItem})
+	if err != nil {
+		return err
+	}
+	return workflow.SetUpdateHandler(ctx, UpdateClose, w.requestClose)
+}
+
+// requestClose asks the main loop to close the bill and replies once the
+// total is frozen and stored, with the total and the line items it covers.
+// Closing a bill that is already closing or closed just returns it.
+func (w *billWorkflow) requestClose(ctx workflow.Context) (domain.Bill, error) {
+	w.closeRequested = true
+	if err := workflow.Await(ctx, func() bool { return w.frozen }); err != nil {
+		return domain.Bill{}, err
+	}
+	return w.bill, nil
 }
 
 // validateLineItem runs before the update is accepted. A rejection here is
@@ -155,22 +181,15 @@ func (w *billWorkflow) addLineItem(ctx workflow.Context, in AddLineItemInput) (d
 	return item, nil
 }
 
-// waitForPeriodEndOrClose blocks until the period ends or a close signal
-// arrives, whichever happens first.
-func (w *billWorkflow) waitForPeriodEndOrClose(ctx workflow.Context) {
-	timerCtx, cancelTimer := workflow.WithCancel(ctx)
-	defer cancelTimer()
-
-	sel := workflow.NewSelector(ctx)
-	sel.AddReceive(workflow.GetSignalChannel(ctx, SignalClose), func(c workflow.ReceiveChannel, _ bool) {
-		c.Receive(ctx, nil)
-	})
-	if d := w.bill.PeriodEnd.Sub(workflow.Now(ctx)); d > 0 {
-		sel.AddFuture(workflow.NewTimer(timerCtx, d), func(workflow.Future) {})
-	} else {
-		return // period already over
+// waitForPeriodEndOrClose blocks until the period ends or a close is
+// requested, whichever happens first.
+func (w *billWorkflow) waitForPeriodEndOrClose(ctx workflow.Context) error {
+	d := w.bill.PeriodEnd.Sub(workflow.Now(ctx))
+	if d <= 0 {
+		return nil // period already over
 	}
-	sel.Select(ctx)
+	_, err := workflow.AwaitWithTimeout(ctx, d, func() bool { return w.closeRequested })
+	return err
 }
 
 // close freezes the total, charges it and records the result. It reports
@@ -194,6 +213,7 @@ func (w *billWorkflow) close(ctx workflow.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	w.frozen = true
 
 	// Nothing to charge when refunds cancel out or exceed fees; the bill
 	// closes with its (zero or negative) total recorded as a credit.
@@ -220,26 +240,44 @@ func (w *billWorkflow) close(ctx workflow.Context) (bool, error) {
 	return err == nil, err
 }
 
-// charge runs ChargeBill. Any error means the charge didn't happen: either it
-// was declined or every retry failed.
+// charge runs ChargeBill. An error means the charge was declined, or its
+// outcome is unknown because every attempt failed or timed out; in the
+// second case the provider may still have taken the money.
 func (w *billWorkflow) charge(ctx workflow.Context, total money.Money) error {
-	w.chargeAttempt++
+	key := w.chargeIdempotencyKey()
 	chargeCtx := workflow.WithActivityOptions(ctx, chargeActivityOptions)
 	var res ChargeBillResult
 	err := workflow.ExecuteActivity(chargeCtx, acts.ChargeBill, ChargeBillInput{
-		BillID:    w.bill.ID,
-		AccountID: w.bill.AccountID,
-		Amount:    total,
-		Attempt:   w.chargeAttempt,
+		BillID:         w.bill.ID,
+		AccountID:      w.bill.AccountID,
+		Amount:         total,
+		IdempotencyKey: key,
 	}).Get(ctx, &res)
 
 	logger := workflow.GetLogger(ctx)
 	if err != nil {
-		logger.Warn("charge failed", "billID", w.bill.ID, "attempt", w.chargeAttempt, "error", err)
+		var appErr *temporal.ApplicationError
+		if errors.As(err, &appErr) && appErr.Type() == ErrTypeChargeDeclined {
+			w.declinedCharges++
+		}
+		logger.Warn("charge failed", "billID", w.bill.ID, "idempotencyKey", key, "error", err)
 		return err
 	}
 	logger.Info("charge succeeded", "billID", w.bill.ID, "chargeID", res.ChargeID)
 	return nil
+}
+
+// chargeIdempotencyKey returns the key for the next charge of the bill's
+// frozen total.
+//
+// The key only changes after a decline. A decline is a definite answer (no
+// money moved), and providers replay a cached decline for a repeated key, so
+// a retry needs a new one. Any other failure (timeouts, provider outage) is
+// ambiguous: the charge may have gone through with the response lost. Those
+// retries must reuse the key so the provider returns the original charge
+// instead of taking the money a second time.
+func (w *billWorkflow) chargeIdempotencyKey() string {
+	return fmt.Sprintf("bill-%s-charge-%d", w.bill.ID, w.declinedCharges+1)
 }
 
 func (w *billWorkflow) newLineItem(ctx workflow.Context, in AddLineItemInput) domain.LineItem {

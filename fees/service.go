@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"encore.app/fees/money"
 	"encore.app/fees/payment"
 	"encore.app/fees/store"
 	billworkflow "encore.app/fees/workflow"
@@ -28,14 +27,6 @@ type Service struct {
 func initService() (*Service, error) {
 	ctx := context.Background()
 	st := store.New(db)
-
-	// The currencies table is the source of truth; keep it in memory for
-	// validation (workflow code can't query the DB).
-	currencies, err := st.LoadCurrencies(ctx)
-	if err != nil {
-		return nil, err
-	}
-	money.SetSupportedCurrencies(currencies)
 
 	c, err := client.DialContext(ctx, client.Options{
 		HostPort:  temporalHostPort,

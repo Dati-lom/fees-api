@@ -155,3 +155,15 @@ func newLineItemResponse(li domain.LineItem) *LineItemResponse {
 		CreatedAt:   li.CreatedAt,
 	}
 }
+
+type ListCurrenciesResponse struct {
+	Currencies []CurrencyResponse `json:"currencies"`
+}
+
+type CurrencyResponse struct {
+	Code money.CurrencyCode `json:"code"`
+	Name string             `json:"name"`
+	// MinorUnits is the number of decimal places amounts are expressed in:
+	// 2 means an amount of 1250 is 12.50.
+	MinorUnits int `json:"minor_units"`
+}

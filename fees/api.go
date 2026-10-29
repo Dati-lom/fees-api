@@ -37,6 +37,11 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 	id := uuid.NewV5(billIDNamespace, req.AccountID+"/"+req.IdempotencyKey)
 	params := req.toParams(id, time.Now().UTC())
 
+	// The currencies table decides what is supported. This is checked here,
+	// not in the workflow, so the workflow never reads data that can change.
+	if _, err := s.store.GetCurrency(ctx, params.Currency); err != nil {
+		return nil, toAPIError(err)
+	}
 	// Validate here too so bad input is a 400 now, not a failed workflow.
 	bill, err := domain.NewBill(params)
 	if err != nil {
@@ -94,29 +99,38 @@ func (s *Service) AddLineItem(ctx context.Context, id uuid.UUID, req *AddLineIte
 	return newLineItemResponse(item), nil
 }
 
-// CloseBill closes an open bill before its period ends. Charging happens
-// asynchronously: the response shows CLOSING (or later states); poll
-// GET /bills/:id for the outcome. Closing an already closing or closed bill
-// is a no-op, so retries are safe.
+// CloseBill closes an open bill before its period ends. It returns once the
+// total is frozen, with the total being charged and the line items it covers.
+// Charging happens asynchronously: poll GET /bills/:id for the outcome.
+// Closing an already closing or closed bill returns it unchanged, so retries
+// are safe.
 //
 //encore:api public method=POST path=/bills/:id/close
 func (s *Service) CloseBill(ctx context.Context, id uuid.UUID) (*BillResponse, error) {
-	bill, err := s.GetBill(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if bill.Status != domain.StatusOpen {
-		return bill, nil
+	ctx, cancel := context.WithTimeout(ctx, workflowCallTimeout)
+	defer cancel()
+
+	// No UpdateID: the handler is idempotent, and Temporal would replay the
+	// first close's (possibly outdated) result for a repeated ID.
+	handle, err := s.temporal.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
+		WorkflowID:   billworkflow.WorkflowID(id),
+		UpdateName:   billworkflow.UpdateClose,
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+	})
+	if err == nil {
+		var bill domain.Bill
+		if err = handle.Get(ctx, &bill); err == nil {
+			return newBillResponse(bill), nil
+		}
 	}
 
-	err = s.temporal.SignalWorkflow(ctx, billworkflow.WorkflowID(id), "", billworkflow.SignalClose, nil)
-	if err != nil {
-		return nil, s.workflowCallError(ctx, id, err)
+	// A completed workflow means the bill is already CLOSED (or never
+	// existed, which GetBill reports as 404).
+	var notFound *serviceerror.NotFound
+	if errors.As(err, &notFound) {
+		return s.GetBill(ctx, id)
 	}
-	// The workflow processes the signal right away; report the state the
-	// bill is moving to rather than the OPEN snapshot read above.
-	bill.Status = domain.StatusClosing
-	return bill, nil
+	return nil, s.workflowCallError(ctx, id, err)
 }
 
 // RetryCharge retries closing a bill whose charge failed.
@@ -184,6 +198,25 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 	resp := &ListBillsResponse{Bills: make([]*BillResponse, 0, len(bills))}
 	for _, b := range bills {
 		resp.Bills = append(resp.Bills, newBillResponse(b))
+	}
+	return resp, nil
+}
+
+// ListCurrencies lists the currencies bills can be opened in.
+//
+//encore:api public method=GET path=/currencies
+func (s *Service) ListCurrencies(ctx context.Context) (*ListCurrenciesResponse, error) {
+	currencies, err := s.store.ListCurrencies(ctx)
+	if err != nil {
+		return nil, toAPIError(err)
+	}
+	resp := &ListCurrenciesResponse{Currencies: make([]CurrencyResponse, 0, len(currencies))}
+	for _, c := range currencies {
+		resp.Currencies = append(resp.Currencies, CurrencyResponse{
+			Code:       c.Code,
+			Name:       c.Name,
+			MinorUnits: c.MinorUnits,
+		})
 	}
 	return resp, nil
 }

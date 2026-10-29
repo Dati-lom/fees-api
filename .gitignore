@@ -5,3 +5,4 @@ encore.gen.cue
 .claude
 .mcp.json
 /encore.gen
+fees/workflow/bill_workflow_test.go

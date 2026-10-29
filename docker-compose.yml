@@ -1,0 +1,32 @@
+# Local Temporal for development: `docker compose up -d`, then `encore run`.
+#
+# Only Temporal is here. Postgres is provisioned by Encore itself (in Docker)
+# from fees/db.go when the app starts, so it doesn't belong in this file.
+#
+# This runs Temporal's single-binary dev server (in-memory SQLite persisted to
+# a volume). It is not a production setup.
+services:
+  temporal:
+    image: temporalio/temporal:1.9.1 # CLI 1.9.1, Server 1.32.0, UI 2.54.1
+    command:
+      - server
+      - start-dev
+      - --ip=0.0.0.0
+      - --db-filename=/home/temporal/temporal.db
+    ports:
+      - "7233:7233" # gRPC: the fees service connects here (localhost:7233)
+      - "8233:8233" # Web UI: http://localhost:8233
+    # The image runs as non-root user "temporal". Mount over its home dir, which
+    # the image already owns, so a fresh volume inherits that ownership; a
+    # root-owned mount (e.g. /data) crash-loops with "unable to open database file".
+    volumes:
+      - temporal-db:/home/temporal
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  temporal-db:

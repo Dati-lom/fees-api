@@ -5,7 +5,8 @@
 -- Rows are never deleted: bills are financial records, so there is no
 -- ON DELETE CASCADE.
 
--- Supported currencies (ISO 4217). Keep in sync with money.exponents in Go.
+-- Supported currencies (ISO 4217). This table is the source of truth: insert
+-- a row to support a new currency, no code change or restart needed.
 CREATE TABLE currencies (
     code        TEXT     PRIMARY KEY CHECK (code ~ '^[A-Z]{3}$'),
     name        TEXT     NOT NULL,

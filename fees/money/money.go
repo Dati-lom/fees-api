@@ -17,14 +17,6 @@ var (
 	ErrOverflow         = errors.New("money: overflow")
 )
 
-// New returns a Money of amount minor units, validating the currency.
-func New(amount int64, c CurrencyCode) (Money, error) {
-	if err := c.Validate(); err != nil {
-		return Money{}, err
-	}
-	return Money{Amount: amount, Currency: c}, nil
-}
-
 // Zero returns a zero amount in currency c.
 func Zero(c CurrencyCode) Money { return Money{Currency: c} }
 
@@ -43,18 +35,8 @@ func (m Money) IsPositive() bool { return m.Amount > 0 }
 
 func (m Money) IsZero() bool { return m.Amount == 0 }
 
-// String formats m for humans, e.g. "12.50 GEL". Not for persistence.
+// String formats m for logs, e.g. "1250 GEL" (minor units). Formatting with
+// decimals needs the currency's MinorUnits, which live in the database.
 func (m Money) String() string {
-	cur, err := LookupCurrency(m.Currency)
-	if err != nil || cur.MinorUnits == 0 {
-		return fmt.Sprintf("%d %s", m.Amount, m.Currency)
-	}
-	sign := ""
-	abs := uint64(m.Amount)
-	if m.Amount < 0 {
-		sign = "-"
-		abs = uint64(-(m.Amount + 1)) + 1 // safe for MinInt64
-	}
-	div := uint64(math.Pow10(cur.MinorUnits))
-	return fmt.Sprintf("%s%d.%0*d %s", sign, abs/div, cur.MinorUnits, abs%div, m.Currency)
+	return fmt.Sprintf("%d %s", m.Amount, m.Currency)
 }

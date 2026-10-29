@@ -80,10 +80,12 @@ type NewBillParams struct {
 }
 
 // NewBill validates p and returns an OPEN bill with no line items.
+//
+// Whether p.Currency is supported is not checked here: that is a lookup in
+// the currencies table, which the API does before starting the workflow.
+// NewBill also runs inside the workflow, and workflow code must give the same
+// result on every replay, so it can't depend on data that may change.
 func NewBill(p NewBillParams) (Bill, error) {
-	if err := p.Currency.Validate(); err != nil {
-		return Bill{}, err
-	}
 	if !p.PeriodEnd.After(p.PeriodStart) {
 		return Bill{}, ErrInvalidPeriod
 	}
