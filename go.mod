@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	encore.dev v1.57.13
 	github.com/stretchr/testify v1.11.1
+	go.temporal.io/api v1.63.5
 	go.temporal.io/sdk v1.50.0
 )
 
@@ -25,7 +26,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/robfig/cron v1.2.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	go.temporal.io/api v1.63.5 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect

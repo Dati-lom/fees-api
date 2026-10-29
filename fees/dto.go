@@ -1,11 +1,13 @@
 package fees
 
 import (
+	"slices"
 	"strings"
 	"time"
 
 	"encore.app/fees/domain"
 	"encore.app/fees/money"
+	billworkflow "encore.app/fees/workflow"
 	"encore.dev/beta/errs"
 	"encore.dev/types/uuid"
 )
@@ -16,15 +18,20 @@ import (
 
 // CreateBillRequest is the body of POST /bills.
 type CreateBillRequest struct {
-	AccountID   string             `json:"account_id"`
-	Currency    money.CurrencyCode `json:"currency"`
-	PeriodStart time.Time          `json:"period_start"`
-	PeriodEnd   time.Time          `json:"period_end"`
+	// IdempotencyKey makes retried creates return the same bill instead of
+	// opening a second one.
+	IdempotencyKey string             `header:"Idempotency-Key"`
+	AccountID      string             `json:"account_id"`
+	Currency       money.CurrencyCode `json:"currency"`
+	PeriodStart    time.Time          `json:"period_start"`
+	PeriodEnd      time.Time          `json:"period_end"`
 }
 
 // Validate is called by Encore before the handler runs.
 func (r *CreateBillRequest) Validate() error {
 	switch {
+	case strings.TrimSpace(r.IdempotencyKey) == "":
+		return errs.B().Code(errs.InvalidArgument).Msg("Idempotency-Key header is required").Err()
 	case strings.TrimSpace(r.AccountID) == "":
 		return errs.B().Code(errs.InvalidArgument).Msg("account_id is required").Err()
 	case r.Currency == "":
@@ -65,15 +72,39 @@ func (r *AddLineItemRequest) Validate() error {
 	return nil
 }
 
-func (r *AddLineItemRequest) toLineItem(id, billID uuid.UUID, now time.Time) domain.LineItem {
-	return domain.LineItem{
+func (r *AddLineItemRequest) toInput(id uuid.UUID) billworkflow.AddLineItemInput {
+	return billworkflow.AddLineItemInput{
 		ID:             id,
-		BillID:         billID,
 		Description:    strings.TrimSpace(r.Description),
 		Amount:         r.Amount,
 		IdempotencyKey: r.IdempotencyKey,
-		CreatedAt:      now,
 	}
+}
+
+// ListBillsRequest is the query string of GET /bills.
+type ListBillsRequest struct {
+	AccountID string `query:"account_id"`
+	Status    string `query:"status"`
+	Limit     int    `query:"limit"`
+}
+
+var listableStatuses = []domain.Status{
+	domain.StatusOpen, domain.StatusClosing, domain.StatusClosed, domain.StatusFailed,
+}
+
+func (r *ListBillsRequest) Validate() error {
+	switch {
+	case r.Status != "" && !slices.Contains(listableStatuses, domain.Status(r.Status)):
+		return errs.B().Code(errs.InvalidArgument).Msgf("unknown status %q", r.Status).Err()
+	case r.Limit < 0:
+		return errs.B().Code(errs.InvalidArgument).Msg("limit must not be negative").Err()
+	}
+	return nil
+}
+
+type ListBillsResponse struct {
+	// Bills are returned without line items; use GET /bills/:id for those.
+	Bills []*BillResponse `json:"bills"`
 }
 
 // BillResponse is returned by every endpoint that returns a bill.
@@ -100,12 +131,7 @@ type LineItemResponse struct {
 func newBillResponse(b domain.Bill) *BillResponse {
 	items := make([]LineItemResponse, 0, len(b.LineItems))
 	for _, li := range b.LineItems {
-		items = append(items, LineItemResponse{
-			ID:          li.ID,
-			Description: li.Description,
-			Amount:      li.Amount,
-			CreatedAt:   li.CreatedAt,
-		})
+		items = append(items, *newLineItemResponse(li))
 	}
 	return &BillResponse{
 		ID:          b.ID,
@@ -118,5 +144,14 @@ func newBillResponse(b domain.Bill) *BillResponse {
 		CreatedAt:   b.CreatedAt,
 		ClosedAt:    b.ClosedAt,
 		LineItems:   items,
+	}
+}
+
+func newLineItemResponse(li domain.LineItem) *LineItemResponse {
+	return &LineItemResponse{
+		ID:          li.ID,
+		Description: li.Description,
+		Amount:      li.Amount,
+		CreatedAt:   li.CreatedAt,
 	}
 }
