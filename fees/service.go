@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"encore.app/fees/money"
+	"encore.app/fees/payment"
 	"encore.app/fees/store"
 	billworkflow "encore.app/fees/workflow"
 	"go.temporal.io/sdk/client"
@@ -46,6 +47,10 @@ func initService() (*Service, error) {
 
 	w := worker.New(c, billworkflow.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(billworkflow.BillWorkflow)
+	w.RegisterActivity(&billworkflow.Activities{
+		Store:   st,
+		Charger: payment.NewMockCharger(),
+	})
 	if err := w.Start(); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("start temporal worker: %w", err)
