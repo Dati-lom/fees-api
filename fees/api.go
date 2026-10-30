@@ -179,25 +179,30 @@ func (s *Service) CloseBill(ctx context.Context, id uuid.UUID) (*BillResponse, e
 	return nil, s.workflowCallError(ctx, id, err)
 }
 
-// RetryCharge retries closing a bill whose charge failed.
+// RetryCharge retries closing a bill whose charge failed. It returns once the
+// bill is CLOSING again; poll GET /bills/:id for the outcome. A bill that is
+// not CHARGE_FAILED fails with 409.
 //
 //encore:api auth method=POST path=/bills/:id/retry-charge
 func (s *Service) RetryCharge(ctx context.Context, id uuid.UUID) (*BillResponse, error) {
-	bill, err := s.GetBill(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if bill.Status != domain.StatusFailed {
-		return nil, errs.B().Code(errs.Aborted).
-			Msgf("only %s bills can be retried, bill is %s", domain.StatusFailed, bill.Status).Err()
-	}
+	ctx, cancel := context.WithTimeout(ctx, workflowCallTimeout)
+	defer cancel()
 
-	err = s.temporal.SignalWorkflow(ctx, billworkflow.WorkflowID(id), "", billworkflow.SignalRetryCharge, nil)
+	// No UpdateID: concurrent retries are merged by the workflow, and a
+	// repeated ID would replay an earlier retry's result.
+	handle, err := s.temporal.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
+		WorkflowID:   billworkflow.WorkflowID(id),
+		UpdateName:   billworkflow.UpdateRetryCharge,
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+	})
 	if err != nil {
 		return nil, s.workflowCallError(ctx, id, err)
 	}
-	bill.Status = domain.StatusClosing
-	return bill, nil
+	var bill domain.Bill
+	if err := handle.Get(ctx, &bill); err != nil {
+		return nil, s.workflowCallError(ctx, id, err)
+	}
+	return newBillResponse(bill), nil
 }
 
 // GetBill returns a bill with its line items and, once closing, its total.
@@ -301,6 +306,8 @@ func toAPIError(err error) error {
 		switch appErr.Type() {
 		case billworkflow.ErrTypeBillNotOpen:
 			return errs.B().Code(errs.Aborted).Msg("bill is not open").Err()
+		case billworkflow.ErrTypeNotChargeFailed:
+			return errs.B().Code(errs.Aborted).Msg(appErr.Message()).Err()
 		case billworkflow.ErrTypeCurrencyMismatch,
 			billworkflow.ErrTypeInvalidAmount,
 			billworkflow.ErrTypeInvalidBill,

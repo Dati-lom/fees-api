@@ -27,8 +27,10 @@ const (
 	// UpdateClose closes the bill before its period ends and returns it once
 	// its total is frozen. Charging continues in the background.
 	UpdateClose = "close"
-	// SignalRetryCharge retries closing a bill that is CHARGE_FAILED.
-	SignalRetryCharge = "retryCharge"
+	// UpdateRetryCharge retries closing a bill that is CHARGE_FAILED and
+	// returns it once it is CLOSING again. Charging continues in the
+	// background.
+	UpdateRetryCharge = "retryCharge"
 	// QueryGetBill returns the workflow's current view of the bill.
 	QueryGetBill = "getBill"
 )
@@ -40,6 +42,7 @@ const (
 	ErrTypeInvalidBill      = "InvalidBill"
 	ErrTypeKeyReused        = "IdempotencyKeyReused"
 	ErrTypeNegativeTotal    = "NegativeTotal"
+	ErrTypeNotChargeFailed  = "NotChargeFailed"
 )
 
 // WorkflowID returns the workflow ID for a bill. Using the bill ID makes
@@ -76,6 +79,9 @@ type billWorkflow struct {
 	inflight int
 	// closeRequested is set by UpdateClose; the main loop acts on it.
 	closeRequested bool
+	// retryRequested is set by UpdateRetryCharge; the main loop acts on it.
+	// A flag rather than a queue, so concurrent retries cause one charge.
+	retryRequested bool
 	// frozen is set once the CLOSING status and total are stored, i.e. the
 	// amount to charge is fixed for good.
 	frozen bool
@@ -117,7 +123,10 @@ func BillWorkflow(ctx workflow.Context, params domain.NewBillParams) error {
 			break
 		}
 		// CHARGE_FAILED: stay alive until someone asks to retry.
-		workflow.GetSignalChannel(ctx, SignalRetryCharge).Receive(ctx, nil)
+		if err := workflow.Await(ctx, func() bool { return w.retryRequested }); err != nil {
+			return err
+		}
+		w.retryRequested = false
 	}
 
 	// Let update handlers that are still running reply before completing.
@@ -136,7 +145,33 @@ func (w *billWorkflow) registerHandlers(ctx workflow.Context) error {
 	if err != nil {
 		return err
 	}
-	return workflow.SetUpdateHandler(ctx, UpdateClose, w.requestClose)
+	err = workflow.SetUpdateHandler(ctx, UpdateClose, w.requestClose)
+	if err != nil {
+		return err
+	}
+	return workflow.SetUpdateHandlerWithOptions(ctx, UpdateRetryCharge, w.requestRetry,
+		workflow.UpdateHandlerOptions{Validator: w.validateRetry})
+}
+
+// validateRetry accepts a retry only while the bill is CHARGE_FAILED. The
+// workflow's own state decides, not the database copy, which may lag.
+func (w *billWorkflow) validateRetry(ctx workflow.Context) error {
+	if w.bill.Status != domain.StatusFailed {
+		return temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("only %s bills can be retried, bill is %s", domain.StatusFailed, w.bill.Status),
+			ErrTypeNotChargeFailed, nil)
+	}
+	return nil
+}
+
+// requestRetry asks the main loop to close the bill again and replies once it
+// has left CHARGE_FAILED.
+func (w *billWorkflow) requestRetry(ctx workflow.Context) (domain.Bill, error) {
+	w.retryRequested = true
+	if err := workflow.Await(ctx, func() bool { return w.bill.Status != domain.StatusFailed }); err != nil {
+		return domain.Bill{}, err
+	}
+	return w.bill, nil
 }
 
 // requestClose asks the main loop to close the bill and replies once the

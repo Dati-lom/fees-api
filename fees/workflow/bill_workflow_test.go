@@ -98,6 +98,21 @@ func closeBill(env *testsuite.TestWorkflowEnvironment, delay time.Duration, out 
 	}, delay)
 }
 
+// retryCharge sends UpdateRetryCharge and records the outcome in *outErr,
+// if outErr is not nil.
+func retryCharge(env *testsuite.TestWorkflowEnvironment, outErr *error) {
+	record := func(err error) {
+		if outErr != nil {
+			*outErr = err
+		}
+	}
+	env.UpdateWorkflow(UpdateRetryCharge, "", &testsuite.TestUpdateCallback{
+		OnAccept:   func() {},
+		OnReject:   record,
+		OnComplete: func(_ any, err error) { record(err) },
+	})
+}
+
 func finalBill(t *testing.T, env *testsuite.TestWorkflowEnvironment) domain.Bill {
 	t.Helper()
 	res, err := env.QueryWorkflow(QueryGetBill)
@@ -210,7 +225,7 @@ func TestDeclinedChargeThenRetryUsesNewIdempotencyKey(t *testing.T) {
 	addItem(t, env, time.Hour, "fee", gel(500), &err)
 	env.RegisterDelayedCallback(func() {
 		require.Equal(t, domain.StatusFailed, finalBill(t, env).Status)
-		env.SignalWorkflow(SignalRetryCharge, nil)
+		retryCharge(env, nil)
 	}, 40*24*time.Hour) // after period end
 
 	env.ExecuteWorkflow(BillWorkflow, params(t, "acc-1"))
@@ -315,7 +330,7 @@ func TestUnknownChargeOutcomeRetryReusesIdempotencyKey(t *testing.T) {
 	addItem(t, env, time.Hour, "fee", gel(500), &err)
 	env.RegisterDelayedCallback(func() {
 		require.Equal(t, domain.StatusFailed, finalBill(t, env).Status)
-		env.SignalWorkflow(SignalRetryCharge, nil)
+		retryCharge(env, nil)
 	}, 40*24*time.Hour)
 
 	env.ExecuteWorkflow(BillWorkflow, params(t, "acc-1"))
@@ -367,7 +382,7 @@ func TestChargeWithLostResponsesIsNotDuplicated(t *testing.T) {
 	addItem(t, env, time.Hour, "fee", gel(500), &err)
 	env.RegisterDelayedCallback(func() {
 		require.Equal(t, domain.StatusFailed, finalBill(t, env).Status)
-		env.SignalWorkflow(SignalRetryCharge, nil)
+		retryCharge(env, nil)
 	}, 40*24*time.Hour)
 
 	env.ExecuteWorkflow(BillWorkflow, params(t, "acc-1"))
@@ -508,4 +523,55 @@ func TestTransientFailuresAreRetried(t *testing.T) {
 	}
 	env.AssertNotCalled(t, "MarkChargeFailed", mock.Anything, mock.Anything)
 	require.Equal(t, 1, charger.Charges(), "customer must be charged exactly once")
+}
+
+func TestRetryChargeRejectedUnlessChargeFailed(t *testing.T) {
+	env := newEnv(t)
+	env.OnActivity(acts.ChargeBill, mock.Anything, mock.Anything).Return(ChargeBillResult{ChargeID: "ch_1"}, nil)
+
+	var itemErr, openErr error
+	addItem(t, env, time.Hour, "fee", gel(500), &itemErr)
+	env.RegisterDelayedCallback(func() { retryCharge(env, &openErr) }, 2*time.Hour)
+
+	env.ExecuteWorkflow(BillWorkflow, params(t, "acc-1"))
+
+	require.NoError(t, env.GetWorkflowError())
+	require.Equal(t, ErrTypeNotChargeFailed, errType(openErr), "an OPEN bill can't be retried")
+	env.AssertNumberOfCalls(t, "ChargeBill", 1)
+}
+
+// TestConcurrentRetriesChargeOnce sends two retries at the same moment to a
+// CHARGE_FAILED bill. They cause a single new charge (the second one either
+// joins the first or is rejected because the bill is already CLOSING), and a
+// later failure doesn't trigger another retry on its own.
+func TestConcurrentRetriesChargeOnce(t *testing.T) {
+	env := newEnv(t)
+	declined := temporal.NewNonRetryableApplicationError("declined", ErrTypeChargeDeclined, nil)
+	var charges int
+	env.OnActivity(acts.ChargeBill, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, _ ChargeBillInput) (ChargeBillResult, error) {
+			charges++
+			return ChargeBillResult{}, declined // every charge is declined
+		})
+
+	var itemErr, retry1, retry2 error
+	addItem(t, env, time.Hour, "fee", gel(500), &itemErr)
+	env.RegisterDelayedCallback(func() {
+		require.Equal(t, domain.StatusFailed, finalBill(t, env).Status)
+		retryCharge(env, &retry1)
+		retryCharge(env, &retry2)
+	}, 40*24*time.Hour)
+	env.RegisterDelayedCallback(func() {
+		// Still failed after the single retry; nothing retried it again.
+		require.Equal(t, domain.StatusFailed, finalBill(t, env).Status)
+		env.CancelWorkflow()
+	}, 50*24*time.Hour)
+
+	env.ExecuteWorkflow(BillWorkflow, params(t, "acc-1"))
+
+	require.NoError(t, retry1)
+	if retry2 != nil {
+		require.Equal(t, ErrTypeNotChargeFailed, errType(retry2))
+	}
+	require.Equal(t, 2, charges, "the first charge plus one retry")
 }
