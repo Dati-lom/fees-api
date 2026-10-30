@@ -91,3 +91,22 @@ func isRetryable(err error) bool {
 	}
 	return false
 }
+
+// IsPermanent reports whether err is a Postgres error that fails the same way
+// however often it is retried: bad data, a violated constraint or a broken
+// query. Connection, resource and transaction-rollback errors are not
+// permanent; they go away once the database recovers.
+func IsPermanent(err error) bool {
+	var dbErr *sqldb.Error
+	if !errors.As(err, &dbErr) || len(dbErr.DatabaseCode) < 2 {
+		return false
+	}
+	// The first two characters of a SQLSTATE are its class.
+	switch dbErr.DatabaseCode[:2] {
+	case "22", // data_exception
+		"23", // integrity_constraint_violation
+		"42": // syntax_error_or_access_rule_violation
+		return true
+	}
+	return false
+}

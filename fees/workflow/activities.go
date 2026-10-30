@@ -11,6 +11,7 @@ import (
 	"encore.app/fees/payment"
 	"encore.app/fees/store"
 	"encore.dev/types/uuid"
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -20,9 +21,9 @@ import (
 // than once; the store and the charger are both idempotent.
 //
 // Errors are split in two:
-//   - permanent (bill not open, declined, ...) are returned as non-retryable
-//     ApplicationErrors with one of the ErrType* types, so the workflow can
-//     react to them;
+//   - permanent (bill not open, declined, a violated DB constraint, ...) are
+//     returned as non-retryable ApplicationErrors with one of the ErrType*
+//     types, so the workflow can react to them;
 //   - everything else (DB down, provider timeout) is returned as is and
 //     Temporal retries it with backoff.
 type Activities struct {
@@ -39,7 +40,16 @@ const (
 	ErrTypeTotalMismatch     = "TotalMismatch"
 	ErrTypeChargeDeclined    = "ChargeDeclined"
 	ErrTypeInvalidCharge     = "InvalidCharge"
+	// ErrTypeDataIntegrity means the database rejected a write in a way no
+	// retry can fix (a violated constraint, bad data, a broken query). It
+	// points to a bug, so it is not mapped to a client error.
+	ErrTypeDataIntegrity = "DataIntegrity"
 )
+
+// stuckAttempt is the attempt from which a DB activity that keeps failing is
+// logged as an error, so alerting notices a write that is retried forever.
+// With the backoff in dbActivityOptions that is roughly 4 to 6 minutes in.
+const stuckAttempt = 10
 
 // Activity options used by the workflow.
 var (
@@ -68,11 +78,11 @@ var (
 )
 
 func (a *Activities) InsertBill(ctx context.Context, bill domain.Bill) error {
-	return classify(a.Store.InsertBill(ctx, bill))
+	return classify(ctx, a.Store.InsertBill(ctx, bill))
 }
 
 func (a *Activities) InsertLineItem(ctx context.Context, item domain.LineItem) error {
-	return classify(a.Store.InsertLineItem(ctx, item))
+	return classify(ctx, a.Store.InsertLineItem(ctx, item))
 }
 
 type StartClosingInput struct {
@@ -81,7 +91,7 @@ type StartClosingInput struct {
 }
 
 func (a *Activities) StartClosing(ctx context.Context, in StartClosingInput) error {
-	return classify(a.Store.StartClosing(ctx, in.BillID, in.Total))
+	return classify(ctx, a.Store.StartClosing(ctx, in.BillID, in.Total))
 }
 
 type MarkClosedInput struct {
@@ -90,7 +100,7 @@ type MarkClosedInput struct {
 }
 
 func (a *Activities) MarkClosed(ctx context.Context, in MarkClosedInput) error {
-	return classify(a.Store.MarkClosed(ctx, in.BillID, in.ClosedAt))
+	return classify(ctx, a.Store.MarkClosed(ctx, in.BillID, in.ClosedAt))
 }
 
 type MarkChargeFailedInput struct {
@@ -98,7 +108,7 @@ type MarkChargeFailedInput struct {
 }
 
 func (a *Activities) MarkChargeFailed(ctx context.Context, in MarkChargeFailedInput) error {
-	return classify(a.Store.MarkChargeFailed(ctx, in.BillID))
+	return classify(ctx, a.Store.MarkChargeFailed(ctx, in.BillID))
 }
 
 type ChargeBillInput struct {
@@ -140,7 +150,7 @@ func (a *Activities) ChargeBill(ctx context.Context, in ChargeBillInput) (Charge
 
 // classify turns permanent store errors into non-retryable activity errors and
 // leaves the rest retryable.
-func classify(err error) error {
+func classify(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -154,8 +164,23 @@ func classify(err error) error {
 		errType = ErrTypeInvalidTransition
 	case errors.Is(err, store.ErrTotalMismatch):
 		errType = ErrTypeTotalMismatch
+	case store.IsPermanent(err):
+		errType = ErrTypeDataIntegrity
 	default:
+		logIfStuck(ctx, err)
 		return err
 	}
 	return temporal.NewNonRetryableApplicationError(err.Error(), errType, err)
+}
+
+// logIfStuck logs err as an error once the activity has failed stuckAttempt
+// times. DB activities retry transient errors forever, so this is how a long
+// database outage shows up instead of only delaying bills silently.
+func logIfStuck(ctx context.Context, err error) {
+	info := activity.GetInfo(ctx)
+	if info.Attempt < stuckAttempt {
+		return
+	}
+	activity.GetLogger(ctx).Error("database write still failing, will keep retrying",
+		"activity", info.ActivityType.Name, "attempt", info.Attempt, "error", err)
 }

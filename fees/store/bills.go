@@ -147,6 +147,24 @@ func (s *Store) GetBill(ctx context.Context, billID uuid.UUID) (domain.Bill, err
 	return b, err
 }
 
+// GetLineItemByKey returns the item stored on billID under idempotency key
+// key, or ErrNotFound.
+func (s *Store) GetLineItemByKey(ctx context.Context, billID uuid.UUID, key string) (domain.LineItem, error) {
+	var li domain.LineItem
+	err := s.db.QueryRow(ctx, `
+		SELECT id, bill_id, description, amount, currency, idempotency_key, created_at
+		FROM line_items WHERE bill_id = $1 AND idempotency_key = $2
+	`, billID, key).Scan(&li.ID, &li.BillID, &li.Description, &li.Amount.Amount, &li.Amount.Currency,
+		&li.IdempotencyKey, &li.CreatedAt)
+	if errors.Is(err, sqldb.ErrNoRows) {
+		return domain.LineItem{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.LineItem{}, fmt.Errorf("get line item: %w", err)
+	}
+	return li, nil
+}
+
 // ListBillsFilter selects bills for ListBills. Zero values mean "any".
 type ListBillsFilter struct {
 	AccountID string

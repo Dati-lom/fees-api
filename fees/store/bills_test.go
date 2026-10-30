@@ -112,6 +112,46 @@ func TestInsertLineItemUnknownBill(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+// TestConstraintViolationIsPermanent checks that a write the database
+// rejects on a constraint is reported as permanent, so the activity fails
+// instead of being retried forever.
+func TestConstraintViolationIsPermanent(t *testing.T) {
+	s := newStore(t)
+	b := insertBill(t, s)
+	item := lineItem(t, b.ID, "usd-fee", 500)
+	// The composite foreign key requires the item's currency to be the bill's.
+	item.Amount.Currency = "USD"
+
+	err := s.InsertLineItem(context.Background(), item)
+	require.Error(t, err)
+	require.True(t, IsPermanent(err), "constraint violation must be permanent: %v", err)
+}
+
+func TestIsPermanentIgnoresOtherErrors(t *testing.T) {
+	require.False(t, IsPermanent(nil))
+	require.False(t, IsPermanent(errors.New("connection reset by peer")))
+	require.False(t, IsPermanent(ErrNotFound))
+}
+
+func TestGetLineItemByKey(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := insertBill(t, s)
+	item := lineItem(t, b.ID, "fee-1", 500)
+	require.NoError(t, s.InsertLineItem(ctx, item))
+
+	got, err := s.GetLineItemByKey(ctx, b.ID, "fee-1")
+	require.NoError(t, err)
+	require.Equal(t, item.ID, got.ID)
+	require.Equal(t, item.Description, got.Description)
+	require.Equal(t, item.Amount, got.Amount)
+
+	_, err = s.GetLineItemByKey(ctx, b.ID, "other-key")
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = s.GetLineItemByKey(ctx, newID(t), "fee-1")
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestStartClosingRetryIsNoop(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)

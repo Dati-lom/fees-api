@@ -37,6 +37,8 @@ var billIDNamespace = uuid.Must(uuid.FromString("6f2a4c1e-8d3b-4f5a-9c7e-2b1d0e3
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*BillResponse, error) {
 	id := uuid.NewV5(billIDNamespace, req.AccountID+"/"+req.IdempotencyKey)
 	params := req.toParams(id, time.Now().UTC())
+	//TODO
+	//When retry when throw error connecting to Temporal
 
 	// The currencies table decides what is supported. This is checked here,
 	// not in the workflow, so the workflow never reads data that can change.
@@ -106,11 +108,11 @@ func (s *Service) AddLineItem(ctx context.Context, id uuid.UUID, req *AddLineIte
 		WaitForStage: client.WorkflowUpdateStageCompleted,
 	})
 	if err != nil {
-		return nil, s.workflowCallError(ctx, id, err)
+		return s.lineItemCallError(ctx, id, in, err)
 	}
 	var item domain.LineItem
 	if err := handle.Get(ctx, &item); err != nil {
-		return nil, s.workflowCallError(ctx, id, err)
+		return s.lineItemCallError(ctx, id, in, err)
 	}
 	// For a repeated UpdateID Temporal returns the first update's result
 	// without running the workflow's validator, so a reused key is caught
@@ -119,6 +121,28 @@ func (s *Service) AddLineItem(ctx context.Context, id uuid.UUID, req *AddLineIte
 		return nil, toAPIError(domain.ErrIdempotencyKeyReused)
 	}
 	return newLineItemResponse(item), nil
+}
+
+// lineItemCallError handles a failed AddLineItem update. Temporal only
+// deduplicates updates while the workflow runs, so once the bill is closed
+// and its workflow has completed, a retry of an item that was added gets
+// NotFound. The item is then looked up by its key in the database, so the
+// retry still returns the original item (or 400 for a different body).
+func (s *Service) lineItemCallError(ctx context.Context, id uuid.UUID, in billworkflow.AddLineItemInput, err error) (*LineItemResponse, error) {
+	var notFound *serviceerror.NotFound
+	if errors.As(err, &notFound) {
+		item, dbErr := s.store.GetLineItemByKey(ctx, id, in.IdempotencyKey)
+		switch {
+		case dbErr == nil:
+			if !in.Matches(item) {
+				return nil, toAPIError(domain.ErrIdempotencyKeyReused)
+			}
+			return newLineItemResponse(item), nil
+		case !errors.Is(dbErr, store.ErrNotFound):
+			return nil, toAPIError(dbErr)
+		}
+	}
+	return nil, s.workflowCallError(ctx, id, err)
 }
 
 // CloseBill closes an open bill before its period ends. It returns once the
